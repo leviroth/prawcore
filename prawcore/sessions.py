@@ -35,14 +35,18 @@ log = logging.getLogger(__package__)
 class RetryStrategy(object):
     """An abstract class for scheduling request retries.
 
-    The strategy controls both the number and frequency of retry attempts.
-
-    Instances of this class are immutable.
+    Instances of this class are immutable state machines that control both the
+    number and frequency of retry attempts.
 
     """
 
     def sleep(self):
-        """Sleep until we are ready to attempt the request."""
+        """Sleep until we are ready to attempt the request.
+
+        :returns: A tuple of the new state of the machine and a bool indicating
+            whether to retry on failure.
+
+        """
         sleep_seconds = self._sleep_seconds()
         if sleep_seconds is not None:
             message = "Sleeping: {:0.2f} seconds prior to retry".format(
@@ -50,10 +54,18 @@ class RetryStrategy(object):
             )
             log.debug(message)
             time.sleep(sleep_seconds)
+        new_state = self._consume_retry()
+        return new_state, new_state._should_retry_on_failure()
 
 
 class FiniteRetryStrategy(RetryStrategy):
     """A ``RetryStrategy`` that retries requests a finite number of times."""
+
+    def _consume_retry(self):
+        return type(self)(self._retries - 1)
+
+    def _should_retry_on_failure(self):
+        return self._retries > 0
 
     def _sleep_seconds(self):
         if self._retries < 3:
@@ -69,13 +81,6 @@ class FiniteRetryStrategy(RetryStrategy):
         """
         self._retries = retries
 
-    def consume_available_retry(self):
-        """Allow one fewer retry."""
-        return type(self)(self._retries - 1)
-
-    def has_remaining_retries(self):
-        """``True`` if and only if the strategy will allow another retry."""
-        return self._retries > 1
 
 
 class Session(object):
@@ -128,7 +133,7 @@ class Session(object):
             )
         self._authorizer = authorizer
         self._rate_limiter = RateLimiter()
-        self._retry_strategy_class = FiniteRetryStrategy
+        self._retry_strategy = FiniteRetryStrategy()
 
     def __enter__(self):
         """Allow this object to be used as a context manager."""
@@ -164,11 +169,11 @@ class Session(object):
             method=method,
             params=params,
             url=url,
-            retry_strategy_state=retry_strategy_state.consume_available_retry(),
+            retry_strategy_state=retry_strategy_state,
         )
 
     def _make_request(
-        self, data, files, json, method, params, retry_strategy_state, url
+        self, data, files, json, method, params, should_retry_on_failure, url
     ):
         try:
             response = self._rate_limiter.call(
@@ -190,7 +195,7 @@ class Session(object):
             )
             return response, None
         except RequestException as exception:
-            if not retry_strategy_state.has_remaining_retries() or not isinstance(
+            if not should_retry_on_failure or not isinstance(
                 exception.original_exception, self.RETRY_EXCEPTIONS
             ):
                 raise
@@ -200,12 +205,12 @@ class Session(object):
         self, data, files, json, method, params, url, retry_strategy_state=None
     ):
         if retry_strategy_state is None:
-            retry_strategy_state = self._retry_strategy_class()
+            retry_strategy_state = self._retry_strategy
 
-        retry_strategy_state.sleep()
+        new_retry_strategy_state, should_retry_on_failure = retry_strategy_state.sleep()
         self._log_request(data, method, params, url)
         response, saved_exception = self._make_request(
-            data, files, json, method, params, retry_strategy_state, url
+            data, files, json, method, params, should_retry_on_failure, url
         )
 
         do_retry = False
@@ -217,7 +222,7 @@ class Session(object):
             if hasattr(self._authorizer, "refresh"):
                 do_retry = True
 
-        if retry_strategy_state.has_remaining_retries() and (
+        if should_retry_on_failure and (
             do_retry
             or response is None
             or response.status_code in self.RETRY_STATUSES
@@ -229,7 +234,7 @@ class Session(object):
                 method,
                 params,
                 response,
-                retry_strategy_state,
+                new_retry_strategy_state,
                 saved_exception,
                 url,
             )
